@@ -1,137 +1,199 @@
-%% run_grid_search_Handwritten.m (🚀 全自动参数雷达搜索 + 终极精度突围版)
 clear; clc;
-warning('off', 'all');
 
-% ---------------------- 1. 基础实验配置 ----------------------
-DATASET_NAME = 'Handwritten'; 
-NUM_RUNS     = 10;         
-T_MAX        = 200;           
-PER_LIST     = [0.0, 0.1, 0.3, 0.5]; 
+% Keep FAST_MODE enabled for the first end-to-end run. After the script
+% finishes successfully, set it to false for the expensive formal study.
+FAST_MODE = true;
 
-% 🚀 [大局锁死] 200个密集锚点，严格死守线性和合规防线
-ANCHOR_M     = 300;    
-PN_NEIGHBORS = 15;     
+DATASET_NAME = 'Handwritten';
+PER_LIST = [0.0, 0.1, 0.3, 0.5];
+GRID_TARGET_PER = 0.3;
+PN_NEIGHBORS = 15;
+KMEANS_REPS = 20;
 
-% ---------------------- 2. 定义自动网格搜索空间 (PHASE 1) ----------------------
-% 围绕你之前的黄金参数，向外辐射搜索最高分辨率的特征解
-LG_SPACE     = [0.1, 0.3, 0.5, 1.0, 1.5];   % \lambda_{graph} 搜索范围
-LA_SPACE     = [0.01, 0.05, 0.1, 0.3, 0.5]; % \lambda_{align} 搜索范围
-GRID_TARGET_PER = 0.3;                      % 🎯 精准瞄准 30% 缺失率进行性能突围
+if FAST_MODE
+    NUM_RUNS = 1;
+    T_MAX = 3;
+    ANCHOR_M = 30;
+    ANCHOR_S = 3;
+    R_ANCHOR = 4;
+    LG_SPACE = 0.5;
+    LA_SPACE = 0.1;
+    Z_MAX_ITER = 3;
+    Z_MAX_SECONDS = 5;
+    run_profile = 'FAST VALIDATION';
+else
+    NUM_RUNS = 10;
+    T_MAX = 200;
+    ANCHOR_M = 300;
+    ANCHOR_S = 3;
+    R_ANCHOR = 10;
+    LG_SPACE = [0.1, 0.3, 0.5, 1.0, 1.5];
+    LA_SPACE = [0.01, 0.05, 0.1, 0.3, 0.5];
+    Z_MAX_ITER = 20;
+    Z_MAX_SECONDS = 10;
+    run_profile = 'FORMAL FULL STUDY';
+end
 
 fprintf('======================================================\n');
-fprintf('  STARTING AUTOMATIC GRID SEARCH & EVALUATION: %s\n', DATASET_NAME);
-fprintf('  SEARCH PROFILE: L_g in [%s], L_a in [%s]\n', num2str(LG_SPACE), num2str(LA_SPACE));
+fprintf('  SR-FIMVC HANDWRITTEN EXPERIMENT\n');
+fprintf('  PROFILE: %s\n', run_profile);
+fprintf('  RUNS=%d, T=%d, ANCHORS=%d, KMEANS_REPS=%d\n', ...
+        NUM_RUNS, T_MAX, ANCHOR_M, KMEANS_REPS);
+fprintf('  GRID: %d x %d parameter combinations\n', ...
+        numel(LG_SPACE), numel(LA_SPACE));
 fprintf('======================================================\n');
+drawnow;
 
-% 🚀 提速核心：只加载 1 次硬盘数据
-fprintf('>>> 正在加载数据集 %s...\n', DATASET_NAME);
-[Xlist, gt, k, ~] = load_dataset_by_name(DATASET_NAME); 
-fprintf('>>> 数据加载完毕！\n');
+[Xlist, gt, k, ~] = load_dataset_by_name(DATASET_NAME);
 
-% ---------------------- 3. 构建高分基础配置骨架 ----------------------
-config_base = struct(... 
-    'T',               T_MAX, ...
-    'use_anchor',      true, ...        % 🚀 [核心主干不动] 死守动态锚点图与 O(N) 复杂度
-    'anchor_m',        ANCHOR_M, ...    
-    'pn',              PN_NEIGHBORS, ... 
-    'R_anchor',        10, ...          
-    'warm_start_iter', 50, ...          
-    'smart_axis',      true, ...        % 出分杀手锏：超球面投影
-    'metric',          'cosine' ...     % 出分杀手锏：余弦度量
-);
+config_base = struct( ...
+    'T', T_MAX, ...
+    'use_anchor', true, ...
+    'anchor_m', ANCHOR_M, ...
+    'anchor_s', ANCHOR_S, ...
+    'pn', PN_NEIGHBORS, ...
+    'R_anchor', R_ANCHOR, ...
+    'R_comm', 3, ...
+    'warm_start_iter', 50, ...
+    'smart_axis', true, ...
+    'metric', 'cosine', ...
+    'kmeans_reps', KMEANS_REPS, ...
+    'structure_z_enabled', true, ...
+    'lambda1', 1.0, ...
+    'lambda2', 1.0, ...
+    'z_max_iter', Z_MAX_ITER, ...
+    'z_max_seconds', Z_MAX_SECONDS, ...
+    'z_constraint_tol', 1e-7, ...
+    'h_gradient_mode', 'objective', ...
+    'h_monotone_safeguard', true, ...
+    'completion_init_mode', 'mean', ...
+    'local_approx_mode', 'orthogonal_bcd', ...
+    'local_approx_max_iter', 50, ...
+    'server_consensus_mode', 'orthogonal_bcd', ...
+    'server_consensus_max_iter', 50);
 
-% 🌟 外部独立赋值，彻底避开 MATLAB 嵌套 Cell 的闪退死穴
-config_base.X_raw  = Xlist;
+config_base.X_raw = Xlist;
 config_base.gt_raw = gt;
-config_base.k      = k;
+config_base.k = k;
 
-% ---------------------- 4. PHASE 1: 全自动网格搜索展开 ----------------------
 fprintf('\n======================================================\n');
-fprintf('  🔍 PHASE 1: SEARCHING FOR OPTIMAL PARAMETERS (PER=0.3)\n');
+fprintf('  PHASE 1: PARAMETER SEARCH AT PER=%.1f\n', GRID_TARGET_PER);
 fprintf('======================================================\n');
 
-best_acc = 0;
-best_lg  = 0.5; % 默认兜底参数
-best_la  = 0.1;
+best_acc = -inf;
+best_lg = NaN;
+best_la = NaN;
+grid_total = numel(LG_SPACE) * numel(LA_SPACE);
+grid_index = 0;
 
 for lg = LG_SPACE
     for la = LA_SPACE
-        % 复制基础配置并微调当前组合
+        grid_index = grid_index + 1;
+        fprintf('\n[Grid %d/%d] lambda_graph=%.3g, lambda_align=%.3g\n', ...
+                grid_index, grid_total, lg, la);
+        fprintf('The first round can take time because six constrained Z updates run before Round 1 is printed.\n');
+        drawnow;
+
         tmp_cfg = config_base;
         tmp_cfg.PER = GRID_TARGET_PER;
         tmp_cfg.lambda_graph = lg;
         tmp_cfg.lambda_align = la;
-        
-        % 搜索阶段每种组合跑 1 次快速扫射，寻找最优区间
-        R = main_fed_SR_FIMVC(DATASET_NAME, 1, tmp_cfg);
-        fprintf('  [Radar Trial] L_g=%.2f, L_a=%.2f => TARGET ACC: %.4f (NMI: %.4f)\n', lg, la, R.best.acc, R.best.nmi);
-        
-        % 刷新历史最高分纪录
-        if R.best.acc > best_acc
-            best_acc = R.best.acc;
-            best_lg  = lg;
-            best_la  = la;
+
+        trial_timer = tic;
+        try
+            R = main_fed_SR_FIMVC(DATASET_NAME, 1, tmp_cfg);
+            fprintf('[Grid %d/%d completed in %.1f s] ACC=%.4f, NMI=%.4f, ARI=%.4f\n', ...
+                    grid_index, grid_total, toc(trial_timer), ...
+                    R.best.acc, R.best.nmi, R.best.ari);
+            if R.best.acc > best_acc
+                best_acc = R.best.acc;
+                best_lg = lg;
+                best_la = la;
+            end
+        catch ME
+            warning('Grid trial %d failed: %s', grid_index, ME.message);
         end
+        drawnow;
     end
 end
 
-fprintf('\n🌟 雷达搜索大捷！针对 PER=0.3 的最强神仙参数已锁定：\n');
-fprintf('   👉 LAMBDA_GRAPH = %.2f\n', best_lg);
-fprintf('   👉 LAMBDA_ALIGN = %.2f\n', best_la);
-fprintf('   👉 探测最高 ACC  = %.4f\n', best_acc);
+if ~isfinite(best_acc)
+    error('All grid-search trials failed. Review the warnings above.');
+end
 
-% ---------------------- 5. PHASE 2: 正式展开多缺失率多轮实验 ----------------------
-fprintf('\n======================================================\n');
-fprintf('  🚀 PHASE 2: FINAL EVALUATION WITH OPTIMAL PARAMETERS\n');
-fprintf('======================================================\n');
+fprintf('\nBest grid result: ACC=%.4f, lambda_graph=%.3g, lambda_align=%.3g\n', ...
+        best_acc, best_lg, best_la);
 
-% 更新配置为网格搜索出的最强组合
 config_base.lambda_graph = best_lg;
 config_base.lambda_align = best_la;
 
-results_table = table();
-all_runs_details = struct('PER', {}, 'RUN_ID', {}, 'R', {}); 
-detail_counter = 1;
+fprintf('\n======================================================\n');
+fprintf('  PHASE 2: FINAL EVALUATION\n');
+fprintf('======================================================\n');
 
-for p = 1:length(PER_LIST)
+results_table = table();
+all_runs_details = struct('PER', {}, 'RUN_ID', {}, 'R', {});
+detail_counter = 1;
+timestamp = datestr(now, 'yyyymmdd_HHMMSS');
+checkpoint_filename = sprintf('checkpoint_%s_%s.mat', DATASET_NAME, timestamp);
+save_filename = sprintf('results_FINAL_%s_%s.mat', DATASET_NAME, timestamp);
+
+for p = 1:numel(PER_LIST)
     current_per = PER_LIST(p);
-    
     acc_runs = zeros(NUM_RUNS, 1);
     nmi_runs = zeros(NUM_RUNS, 1);
-    ari_runs = zeros(NUM_RUNS, 1); 
+    ari_runs = zeros(NUM_RUNS, 1);
     purity_runs = zeros(NUM_RUNS, 1);
-    
-    fprintf('\n--- Running Final PER = %.2f (%d Runs) ---\n', current_per, NUM_RUNS);
+
+    fprintf('\n--- PER=%.2f: %d run(s) ---\n', current_per, NUM_RUNS);
+    drawnow;
 
     for run = 1:NUM_RUNS
+        fprintf('[PER %.2f, run %d/%d] starting...\n', current_per, run, NUM_RUNS);
+        drawnow;
+
         config = config_base;
         config.PER = current_per;
-        
-        R = main_fed_SR_FIMVC(DATASET_NAME, run, config); 
-        
-        acc_runs(run) = R.best.acc; 
+        run_timer = tic;
+        R = main_fed_SR_FIMVC(DATASET_NAME, run, config);
+
+        acc_runs(run) = R.best.acc;
         nmi_runs(run) = R.best.nmi;
-        ari_runs(run) = R.best.ari; 
+        ari_runs(run) = R.best.ari;
         purity_runs(run) = R.best.purity;
-        
+
         all_runs_details(detail_counter).PER = current_per;
         all_runs_details(detail_counter).RUN_ID = run;
         all_runs_details(detail_counter).R = R;
         detail_counter = detail_counter + 1;
-        
-        fprintf('  Run %d: ACC=%.4f, NMI=%.4f, ARI=%.4f\n', run, R.best.acc, R.best.nmi, R.best.ari); 
+
+        fprintf('[PER %.2f, run %d/%d completed in %.1f s] ACC=%.4f, NMI=%.4f, ARI=%.4f\n', ...
+                current_per, run, NUM_RUNS, toc(run_timer), ...
+                R.best.acc, R.best.nmi, R.best.ari);
+        save(checkpoint_filename, 'results_table', 'all_runs_details', ...
+             'config_base', 'FAST_MODE', '-v7.3');
+        drawnow;
     end
-    
-    new_row = table(current_per, mean(acc_runs), std(acc_runs), mean(nmi_runs), std(nmi_runs), ...
-                    mean(ari_runs), std(ari_runs), mean(purity_runs), std(purity_runs), ...
-        'VariableNames', {'PER', 'ACC_Mean', 'ACC_Std', 'NMI_Mean', 'NMI_Std', 'ARI_Mean', 'ARI_Std', 'Pur_Mean', 'Pur_Std'});
-    results_table = [results_table; new_row];
+
+    new_row = table(current_per, mean(acc_runs), std(acc_runs), ...
+                    mean(nmi_runs), std(nmi_runs), ...
+                    mean(ari_runs), std(ari_runs), ...
+                    mean(purity_runs), std(purity_runs), ...
+        'VariableNames', {'PER', 'ACC_Mean', 'ACC_Std', ...
+                          'NMI_Mean', 'NMI_Std', ...
+                          'ARI_Mean', 'ARI_Std', ...
+                          'Pur_Mean', 'Pur_Std'});
+    results_table = [results_table; new_row]; %#ok<AGROW>
+    save(checkpoint_filename, 'results_table', 'all_runs_details', ...
+         'config_base', 'FAST_MODE', '-v7.3');
 end
 
-% ---------------------- 6. 展示与全面封存 ----------------------
-disp('======================================================');
-disp('FINAL RESULTS TABLE (Handwritten - Auto Grid Search Mode)');
+fprintf('\n======================================================\n');
+fprintf('  FINAL RESULTS\n');
+fprintf('======================================================\n');
 disp(results_table);
-save_filename = sprintf('results_FINAL_GridSearch_%s_%s.mat', DATASET_NAME, datestr(now, 'yyyymmdd_HHMM'));
-save(save_filename, 'results_table', 'all_runs_details', 'config_base');
-fprintf('>>> 成功！最优全量大表数据已保存至: %s\n', save_filename);
+
+save(save_filename, 'results_table', 'all_runs_details', ...
+     'config_base', 'FAST_MODE', '-v7.3');
+fprintf('Saved final results to: %s\n', save_filename);
+fprintf('Checkpoint file: %s\n', checkpoint_filename);

@@ -1,4 +1,4 @@
-function R = main_fed_SR_FIMVC(dataset_name, run, config)
+﻿function R = main_fed_SR_FIMVC(dataset_name, run, config)
 % =========================================================================
 % SR-FIMVC (Auto-Weighted Version + 🌋 Stress Test Interceptor)
 % 🌟 核心升级：恢复视图加权机制，解决 PER=0.5 时被噪声视图拖累的问题。
@@ -10,7 +10,7 @@ rng(run);
 %% ---------- defaults ----------
 df = struct( ...
     'k',[], 'T',10, ...
-    'lambda_graph',0.5, 'lambda_align',0.1, ... 
+    'lambda_graph',0.5, 'lambda_align',0.1, 'lambda2',1.0, ... 
     'use_anchor',true, 'pn',10, ...
     'R_comm',1, 'R_anchor',1, ...
     'anchor_m',[], 'anchor_s',12, ...
@@ -106,12 +106,6 @@ config.k = max(2, numel(unique(gt_vec)));
 
 % [NEW] 初始化视图权重 (均匀)
 view_weight = ones(1, nV) / nV;
-
-%% ---------- L (Initial Static Graph) ----------
-tL = tic;
-% [FIXED] 传入 Omega_list 以启用 G^(v) 过滤
-L_sum = sum_L_per_view(X_completed_list, Omega_list, config, view_weight);
-if is_near_zero_L(L_sum), L_sum = fallback_knn_L(X_completed_list, 10); end
 
 %% ---------- SVD + Global Init (Hybrid Version) ----------
 % [优化] 支持两种初始化策略：
@@ -209,16 +203,25 @@ catch
 end
 
 % === 初始化后续变量 ===
-Yv = cell(1,nV); Cv = cell(1,nV); K_diag_weights = cell(1, nV); 
+Yv = cell(1,nV); Cv = cell(1,nV); K_diag_weights = cell(1, nV);
+anchor_states = cell(1,nV); 
 for v = 1:nV
-    Yv{v} = one_hot(y_init, config.k); 
-    Cv{v} = eye(config.k); 
+    Yv{v} = one_hot(y_init, config.k);
+    % Local orthogonal approximation (Eq. 7), distinct from global blocks.
+    [Uc,~,Vc] = svd(full(Yv{v}' * Hv{v}), 'econ');
+    Cv{v} = Uc * Vc';
     K_diag_weights{v} = ones(N, 1);
 end
-server.Y = Yv{1};
-server.C_blocks = cell(1, nV);
-for v = 1:nV, server.C_blocks{v} = eye(config.k); end
-server.C = cat(2, server.C_blocks{:}); 
+server.Y = one_hot(y_init, config.k);
+% Initial global centroids in the concatenated latent space (N-by-Vk).
+% The rectangular Procrustes factor satisfies C*C' = I_k.
+Hc_init = cat(2,Hv{:});
+[Uc,~,Vc] = svd(full(server.Y' * Hc_init), 'econ');
+server.C = Uc * Vc';
+server.C_blocks = cell(1,nV);
+for v = 1:nV
+    server.C_blocks{v} = server.C(:,(v-1)*config.k+(1:config.k));
+end
 server.C_ref = server.C_blocks{1};
 
 %% ---------- Main Loop ----------
@@ -231,50 +234,32 @@ no_improve = 0;
 for t = 1:T
     tt = tic;
     
-    if t > config.warm_start_iter && config.R_anchor > 0 && mod(t, config.R_anchor) == 0
-        fprintf('[debug] t=%d: Refresh Graph (Server Consensus L_sum)...\n', t);
-        % === [严格匹配论文 Eq.18 构造全局图 L_sum] ===
-        % 论文描述: 服务器使用共识 Y 构造 S = YY^T, 然后 L_sum = D_S - S
-        
-        % 1. 构造共识亲和矩阵 S (利用稀疏乘法防内存爆炸)
+    % Reconstruct feedback initially and after each server synchronization.
+    % Anchor refresh has its own independent period inside each client.
+    if t == 1 || (config.R_comm > 0 && mod(t-1,config.R_comm) == 0)
+        % Eq. (18). Explicit graph retained here; replacing it with an
+        % implicit operator is a separate scalability change.
         S_consensus = sparse(server.Y) * sparse(server.Y)';
-                     
-        % 2. 消除自环 (使用 spdiags 绝对防止内存溢出！)
-        S_consensus = S_consensus - spdiags(diag(S_consensus), 0, N, N);  
-        
-        % 3. 计算度矩阵 D_S
-        D_S = spdiags(sum(S_consensus, 2), 0, N, N); % 稀疏对角阵更省内存
-        
-        % 4. 生成全局拉普拉斯
-        L_new = D_S - S_consensus;
-        
-        if ~is_near_zero_L(L_new)
-            L_sum = L_new; 
-        end
-        % ==============================================
+        D_S = spdiags(sum(S_consensus,2),0,N,N);
+        L_sum = D_S - S_consensus;
     end
 
     % Client
     for v = 1:nV
-        [Yv{v}, Cv{v}, Hv{v}, X_completed_list{v}, K_diag_weights{v}] = ...
+        [Yv{v}, Cv{v}, Hv{v}, X_completed_list{v}, K_diag_weights{v}, anchor_states{v}] = ...
             client_step_RWC(X_incomplete_list{v}, Omega_list{v}, X_completed_list{v}, ...
                             L_sum, Hv{v}, Yv{v}, Cv{v}, ...
-                            server.C_blocks{v}, K_diag_weights{v}, config);
+                            server.C_blocks{v}, K_diag_weights{v}, config, anchor_states{v});
     end
 
-    % Server
-    srv_prevY = server.Y;
+    % Server: preserve the paired hard labels and centroids from Eqs. 16-17.
     if config.R_comm > 0 && mod(t, config.R_comm) == 0
         server = server_step_plus(server, make_clients_from(Yv, Cv), config);
-        server.Y = align_columns_by_hungarian(srv_prevY, server.Y);
-        
-        alpha = 0.5; tau = 0.5;
-        server.Y = (1 - alpha) * srv_prevY + alpha * server.Y;
-        server.Y = row_normalize(server.Y .^ (1 / tau));
-
-        for v = 1:nV, Yv{v} = server.Y; Cv{v} = server.C_blocks{v}; end
+        % No extra label permutation or temporal mixing: server.Y already
+        % uses the cluster coordinates of server.C. Clients retain Yv/Cv;
+        % only the separate C_blocks provide global guidance next round.
     end
-    
+
     % [NEW] 🌟 Update View Weights 🌟
     if config.use_view_w
         errs = zeros(1, nV);
@@ -338,48 +323,8 @@ function cfg = set_defaults(cfg, df)
     fn=fieldnames(df); for i=1:numel(fn), if ~isfield(cfg,fn{i}), cfg.(fn{i})=df.(fn{i}); end; end
 end
 function idx = argmax_rows(Y), [~,idx]=max(Y,[],2); end
-function Y = row_normalize(Y), s=sum(Y,2); s(s==0)=1; Y=Y./s; end
 function clients = make_clients_from(Ycell, Ccell)
     for i=1:numel(Ycell), clients{i}.Y=Ycell{i}; clients{i}.C=Ccell{i}; end
-end
-function Y2a = align_columns_by_hungarian(Y1, Y2)
-    % 1. 如果有空矩阵，直接返回
-    if isempty(Y1) || isempty(Y2)
-        Y2a = Y2; 
-        return; 
-    end
-    
-    % 2. 计算成本矩阵 (负的相似度)
-    costMatrix = -(Y1' * Y2); 
-    
-    % 3. 防爆匈牙利匹配逻辑
-    costMatrix(isnan(costMatrix)) = 1e6;
-    num_clusters = size(costMatrix, 1);
-    
-    try
-        pairs = matchpairs(costMatrix, 1e6);
-        assignment = zeros(1, num_clusters);
-        if ~isempty(pairs)
-            % 【最核心的修复】正确的正向映射！
-            assignment(pairs(:,1)) = pairs(:,2); 
-        end
-        
-        % 安全补全：处理未匹配索引
-        unassigned_rows = find(assignment == 0);
-        unassigned_cols = setdiff(1:num_clusters, assignment);
-        if ~isempty(unassigned_rows)
-            assignment(unassigned_rows) = unassigned_cols(1:length(unassigned_rows));
-        end
-    catch
-        % 兜底：贪心匹配
-        [~, assignment] = max(-costMatrix, [], 2);
-        if numel(unique(assignment)) < num_clusters
-             assignment = 1:num_clusters; 
-        end
-    end
-    
-    % 4. 执行列重排对齐
-    Y2a = Y2(:, assignment);
 end
 function Lsum = sum_L_per_view(Xset, Omega_list, cfg, weights) % <--- 1. 增加参数 Omega_list
     if nargin < 4, weights = ones(1, numel(Xset)) / numel(Xset); end

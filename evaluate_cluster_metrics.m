@@ -1,13 +1,17 @@
-function metrics = evaluate_cluster_metrics(assign, gt)
+﻿function metrics = evaluate_cluster_metrics(assign, gt)
 % Robust metrics: ACC, NMI, Purity, F1, ARI
 % 修复：使用标准的列联表组合计数法计算 ARI，以解决数值溢出和归一化为 0 的问题。
 
     % --- sanitize labels ---
     assign = assign(:); gt = gt(:);
-    n = min(numel(assign), numel(gt));
-    assign = assign(1:n); gt = gt(1:n);
+    validateattributes(assign, {'numeric','logical'}, {'real','finite','nonempty'});
+    validateattributes(gt, {'numeric','logical'}, {'real','finite','nonempty'});
+    if numel(assign) ~= numel(gt)
+        error('SRFIMVC:LabelLengthMismatch', ...
+              'Predicted and ground-truth labels must have equal lengths.');
+    end
     
-    % --- ACC via Hungarian (with safe fallback) ---
+    % --- ACC via exact one-to-one assignment (no external dependency) ---
     acc = clustering_acc_safe(gt, assign);
 
     % --- NMI ---
@@ -31,20 +35,77 @@ function acc = clustering_acc_safe(y, yhat)
             cm(i,j) = sum(y==c(i) & yhat==k(j));
         end
     end
-    cost = max(cm(:)) - cm;
-    acc = nan;
-    % 假设您有 munkres/hungarian 函数
-    if exist('munkres','file')==2
-        [~, col] = munkres(cost);
-        acc = sum(cm(sub2ind(size(cm),1:numel(c),col)));
-    elseif exist('hungarian','file')==2
-        col = hungarian(cost);
-        acc = sum(cm(sub2ind(size(cm),1:numel(c),col)));
-    else
-        % greedy fallback
-        acc = sum(max(cm,[],2));
+    % Zero padding represents unmatched classes/clusters when counts differ.
+    n = max(size(cm));
+    counts = zeros(n,n);
+    counts(1:size(cm,1),1:size(cm,2)) = cm;
+    cost = max(counts(:)) - counts;
+    cols = exact_assignment(cost);
+    matched = counts(sub2ind([n,n], (1:n)', cols));
+    acc = sum(matched) / numel(y);
+end
+
+function cols = exact_assignment(cost)
+% Shortest augmenting-path Hungarian algorithm, O(n^3).
+% Column slot 1 is a dummy; slots 2:n+1 represent real columns.
+    n = size(cost,1);
+    u = zeros(n,1);
+    v = zeros(n+1,1);
+    p = zeros(n+1,1);
+    way = zeros(n+1,1);
+    for row = 1:n
+        p(1) = row;
+        j0 = 1;
+        minv = inf(n+1,1);
+        used = false(n+1,1);
+        while true
+            used(j0) = true;
+            i0 = p(j0);
+            delta = inf;
+            j1 = 0;
+            for j = 2:n+1
+                if ~used(j)
+                    cur = cost(i0,j-1) - u(i0) - v(j);
+                    if cur < minv(j)
+                        minv(j) = cur;
+                        way(j) = j0;
+                    end
+                    if minv(j) < delta
+                        delta = minv(j);
+                        j1 = j;
+                    end
+                end
+            end
+            if ~isfinite(delta) || j1 == 0
+                error('SRFIMVC:AssignmentFailed', ...
+                      'Exact label assignment failed.');
+            end
+            for j = 1:n+1
+                if used(j)
+                    u(p(j)) = u(p(j)) + delta;
+                    v(j) = v(j) - delta;
+                else
+                    minv(j) = minv(j) - delta;
+                end
+            end
+            j0 = j1;
+            if p(j0) == 0
+                break;
+            end
+        end
+        while true
+            j1 = way(j0);
+            p(j0) = p(j1);
+            j0 = j1;
+            if j0 == 1
+                break;
+            end
+        end
     end
-    acc = acc / numel(y);
+    cols = zeros(n,1);
+    for j = 2:n+1
+        cols(p(j)) = j-1;
+    end
 end
 
 function nmi = nmi_safe(y, yhat)

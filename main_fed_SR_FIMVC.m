@@ -9,6 +9,9 @@ df = struct( ...
     'k',[], 'T',10, ...
     'lambda_graph',0.5, 'lambda_align',0.1, 'lambda2',1.0, ... 
     'structure_z_enabled',true, 'lambda1',1.0, ...
+    'z_solver','projected', 'z_projected_max_iter',5, ...
+    'z_projected_max_backtracks',12, 'z_projected_tol',1e-6, ...
+    'z_projected_step_scale',1.0, ...
     'z_max_iter',20, 'z_max_seconds',10, 'z_constraint_tol',1e-7, ...
     'h_gradient_mode','objective', 'h_monotone_safeguard',true, ...
     'completion_init_mode','mean', ...
@@ -199,9 +202,6 @@ logs.z_updates = cell(T,nV);
 logs.h_updates = cell(T,nV);
 logs.local_approx_updates = cell(T,nV);
 logs.server_updates = cell(T,1);
-best = struct('t',0,'nmi',-inf,'acc',0,'ari',0,'purity',0,'Y',server.Y,'assign',[]);
-patience = 10; 
-no_improve = 0;
 
 for t = 1:T
     tt = tic;
@@ -251,36 +251,45 @@ for t = 1:T
     fprintf('Round %2d | ACC=%.4f  NMI=%.4f  ARI=%.4f | %.2fs\n', ...
         t, metrics.acc, metrics.nmi, metrics.ari, toc(tt));
 
-    if metrics.nmi > best.nmi + 1e-5
-        best.t = t; best.nmi = metrics.nmi; best.acc = metrics.acc; 
-        best.ari = metrics.ari; best.purity = metrics.purity;
-        best.assign = assign; best.Y = server.Y;
-        no_improve = 0;
-    else
-        no_improve = no_improve + 1;
-    end
-    if t >= 20 && no_improve >= patience
-        fprintf('Early stop at t=%d\n', t);
-        break;
-    end
 end
 
 R.final = struct('acc', logs.acc(end), 'nmi', logs.nmi(end), 'ari', logs.ari(end), 'purity', logs.purity(end));
-R.best  = struct('acc', best.acc, 'nmi', best.nmi, 'ari', best.ari, 'purity', best.purity);
 R.final.assign = assign;
-R.best.assign = best.assign;
+% Backward-compatible alias. No ground-truth metric is used to select an
+% iteration: the reported result is always the final optimization round.
+R.best = R.final;
 R.protocol.initial_assign = y_init;
 R.protocol.missing_rows = cell(1,nV);
 for v=1:nV
     R.protocol.missing_rows{v} = find(sum(Omega_list{v},2)==0);
 end
 R.protocol.structure_z_enabled = config.structure_z_enabled;
+R.protocol.z_solver = config.z_solver;
 R.protocol.H_initialization = H_init_info;
 R.protocol.h_gradient_mode = config.h_gradient_mode;
 R.protocol.h_monotone_safeguard = config.h_monotone_safeguard;
 R.protocol.completion_init_mode = config.completion_init_mode;
 R.protocol.local_approx_mode = config.local_approx_mode;
 R.protocol.server_consensus_mode = config.server_consensus_mode;
+R.protocol.result_selection = 'final_iteration_no_label_selection';
+completion_rmse=zeros(1,nV);
+completion_nrmse=zeros(1,nV);
+for v=1:nV
+    missing=(Omega_list{v}==0);
+    if any(missing(:))
+        error_values=X_completed_list{v}(missing)-X_full_list{v}(missing);
+        true_values=X_full_list{v}(missing);
+        completion_rmse(v)=sqrt(mean(error_values.^2));
+        completion_nrmse(v)=norm(error_values)/max(norm(true_values),eps);
+    else
+        completion_rmse(v)=NaN;
+        completion_nrmse(v)=NaN;
+    end
+end
+R.evaluation=struct('completion_rmse_by_view',completion_rmse, ...
+    'completion_nrmse_by_view',completion_nrmse, ...
+    'completion_rmse_mean',mean(completion_rmse(~isnan(completion_rmse))), ...
+    'completion_nrmse_mean',mean(completion_nrmse(~isnan(completion_nrmse))));
 R.logs = logs;
 end
 

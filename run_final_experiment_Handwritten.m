@@ -1,4 +1,6 @@
 clear; clc;
+script_root=fileparts(mfilename('fullpath'));
+addpath(script_root,'-begin');
 
 % Keep FAST_MODE enabled for the first end-to-end run. After the script
 % finishes successfully, set it to false for the expensive formal study.
@@ -6,9 +8,10 @@ FAST_MODE = true;
 
 DATASET_NAME = 'Handwritten';
 PER_LIST = [0.0, 0.1, 0.3, 0.5];
-GRID_TARGET_PER = 0.3;
 PN_NEIGHBORS = 15;
 KMEANS_REPS = 20;
+LAMBDA_GRAPH = 0.5;
+LAMBDA_ALIGN = 0.1;
 
 if FAST_MODE
     NUM_RUNS = 1;
@@ -16,10 +19,7 @@ if FAST_MODE
     ANCHOR_M = 30;
     ANCHOR_S = 3;
     R_ANCHOR = 4;
-    LG_SPACE = 0.5;
-    LA_SPACE = 0.1;
-    Z_MAX_ITER = 3;
-    Z_MAX_SECONDS = 5;
+    Z_PROJECTED_MAX_ITER = 3;
     run_profile = 'FAST VALIDATION';
 else
     NUM_RUNS = 10;
@@ -27,10 +27,7 @@ else
     ANCHOR_M = 300;
     ANCHOR_S = 3;
     R_ANCHOR = 10;
-    LG_SPACE = [0.1, 0.3, 0.5, 1.0, 1.5];
-    LA_SPACE = [0.01, 0.05, 0.1, 0.3, 0.5];
-    Z_MAX_ITER = 20;
-    Z_MAX_SECONDS = 10;
+    Z_PROJECTED_MAX_ITER = 5;
     run_profile = 'FORMAL FULL STUDY';
 end
 
@@ -39,8 +36,8 @@ fprintf('  SR-FIMVC HANDWRITTEN EXPERIMENT\n');
 fprintf('  PROFILE: %s\n', run_profile);
 fprintf('  RUNS=%d, T=%d, ANCHORS=%d, KMEANS_REPS=%d\n', ...
         NUM_RUNS, T_MAX, ANCHOR_M, KMEANS_REPS);
-fprintf('  GRID: %d x %d parameter combinations\n', ...
-        numel(LG_SPACE), numel(LA_SPACE));
+fprintf('  FIXED PARAMETERS: lambda_graph=%.3g, lambda_align=%.3g\n', ...
+        LAMBDA_GRAPH, LAMBDA_ALIGN);
 fprintf('======================================================\n');
 drawnow;
 
@@ -55,80 +52,32 @@ config_base = struct( ...
     'R_anchor', R_ANCHOR, ...
     'R_comm', 3, ...
     'warm_start_iter', 50, ...
-    'smart_axis', true, ...
+    'smart_axis', false, ...
     'metric', 'cosine', ...
     'kmeans_reps', KMEANS_REPS, ...
     'structure_z_enabled', true, ...
+    'z_solver', 'projected', ...
     'lambda1', 1.0, ...
     'lambda2', 1.0, ...
-    'z_max_iter', Z_MAX_ITER, ...
-    'z_max_seconds', Z_MAX_SECONDS, ...
-    'z_constraint_tol', 1e-7, ...
+    'z_projected_max_iter', Z_PROJECTED_MAX_ITER, ...
+    'z_projected_max_backtracks', 12, ...
+    'z_projected_tol', 1e-6, ...
     'h_gradient_mode', 'objective', ...
     'h_monotone_safeguard', true, ...
     'completion_init_mode', 'mean', ...
     'local_approx_mode', 'orthogonal_bcd', ...
     'local_approx_max_iter', 50, ...
     'server_consensus_mode', 'orthogonal_bcd', ...
-    'server_consensus_max_iter', 50);
+    'server_consensus_max_iter', 50, ...
+    'lambda_graph', LAMBDA_GRAPH, ...
+    'lambda_align', LAMBDA_ALIGN);
 
 config_base.X_raw = Xlist;
 config_base.gt_raw = gt;
 config_base.k = k;
 
 fprintf('\n======================================================\n');
-fprintf('  PHASE 1: PARAMETER SEARCH AT PER=%.1f\n', GRID_TARGET_PER);
-fprintf('======================================================\n');
-
-best_acc = -inf;
-best_lg = NaN;
-best_la = NaN;
-grid_total = numel(LG_SPACE) * numel(LA_SPACE);
-grid_index = 0;
-
-for lg = LG_SPACE
-    for la = LA_SPACE
-        grid_index = grid_index + 1;
-        fprintf('\n[Grid %d/%d] lambda_graph=%.3g, lambda_align=%.3g\n', ...
-                grid_index, grid_total, lg, la);
-        fprintf('The first round can take time because six constrained Z updates run before Round 1 is printed.\n');
-        drawnow;
-
-        tmp_cfg = config_base;
-        tmp_cfg.PER = GRID_TARGET_PER;
-        tmp_cfg.lambda_graph = lg;
-        tmp_cfg.lambda_align = la;
-
-        trial_timer = tic;
-        try
-            R = main_fed_SR_FIMVC(DATASET_NAME, 1, tmp_cfg);
-            fprintf('[Grid %d/%d completed in %.1f s] ACC=%.4f, NMI=%.4f, ARI=%.4f\n', ...
-                    grid_index, grid_total, toc(trial_timer), ...
-                    R.best.acc, R.best.nmi, R.best.ari);
-            if R.best.acc > best_acc
-                best_acc = R.best.acc;
-                best_lg = lg;
-                best_la = la;
-            end
-        catch ME
-            warning('Grid trial %d failed: %s', grid_index, ME.message);
-        end
-        drawnow;
-    end
-end
-
-if ~isfinite(best_acc)
-    error('All grid-search trials failed. Review the warnings above.');
-end
-
-fprintf('\nBest grid result: ACC=%.4f, lambda_graph=%.3g, lambda_align=%.3g\n', ...
-        best_acc, best_lg, best_la);
-
-config_base.lambda_graph = best_lg;
-config_base.lambda_align = best_la;
-
-fprintf('\n======================================================\n');
-fprintf('  PHASE 2: FINAL EVALUATION\n');
+fprintf('  FINAL EVALUATION (NO GROUND-TRUTH MODEL SELECTION)\n');
 fprintf('======================================================\n');
 
 results_table = table();
@@ -157,10 +106,10 @@ for p = 1:numel(PER_LIST)
         run_timer = tic;
         R = main_fed_SR_FIMVC(DATASET_NAME, run, config);
 
-        acc_runs(run) = R.best.acc;
-        nmi_runs(run) = R.best.nmi;
-        ari_runs(run) = R.best.ari;
-        purity_runs(run) = R.best.purity;
+        acc_runs(run) = R.final.acc;
+        nmi_runs(run) = R.final.nmi;
+        ari_runs(run) = R.final.ari;
+        purity_runs(run) = R.final.purity;
 
         all_runs_details(detail_counter).PER = current_per;
         all_runs_details(detail_counter).RUN_ID = run;
@@ -169,7 +118,7 @@ for p = 1:numel(PER_LIST)
 
         fprintf('[PER %.2f, run %d/%d completed in %.1f s] ACC=%.4f, NMI=%.4f, ARI=%.4f\n', ...
                 current_per, run, NUM_RUNS, toc(run_timer), ...
-                R.best.acc, R.best.nmi, R.best.ari);
+                R.final.acc, R.final.nmi, R.final.ari);
         save(checkpoint_filename, 'results_table', 'all_runs_details', ...
              'config_base', 'FAST_MODE', '-v7.3');
         drawnow;

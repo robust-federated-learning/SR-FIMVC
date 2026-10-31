@@ -115,10 +115,22 @@ if has_missing
     W_sq = sparse(1:N, 1:N, w.^2, N, N);
 
     if refresh && structure_z_enabled
-        % Freeze X_com, U, w and A during the Z step (Eq. 9b).
-        % The new Z then participates in the U and P updates below.
-        [Z_v,z_info] = update_Z_structured(Z_v,X_completed_prev,U_v_temp,w,M_v,A_v,config);
+        if isfield(config,'z_solver'), z_solver=lower(char(config.z_solver));
+        else, z_solver='projected'; end
+        switch z_solver
+            case 'projected'
+                [Z_v,A_v,z_info] = update_Z_projected( ...
+                    Z_v,X_completed_prev,U_v_temp,w,M_v,A_v,config);
+            case 'fmincon_reference'
+                [Z_v,z_info] = update_Z_structured( ...
+                    Z_v,X_completed_prev,U_v_temp,w,M_v,A_v,config);
+                z_info.solver='fmincon_reference';
+            otherwise
+                error('client_step_RWC:InvalidZSolver', ...
+                      'z_solver must be projected or fmincon_reference.');
+        end
         anchor_state.Z = Z_v;
+        anchor_state.A = A_v;
         anchor_state.z_update = z_info;
     end 
 
